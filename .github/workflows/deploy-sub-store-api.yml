@@ -1,0 +1,136 @@
+name: Deploy Sub-Store API
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-sub-store-api
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  WORKER_NAME: sub-store-api
+  KV_NAMESPACE_TITLE: sub-store-api-data
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout Sub-Store
+        uses: actions/checkout@v4
+        with:
+          path: Sub-Store
+          fetch-depth: 1
+
+      - name: Checkout Workers adapter
+        uses: actions/checkout@v4
+        with:
+          repository: Yu9191/sub-store-workers
+          path: sub-store-workers
+          fetch-depth: 1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Configure upstream pnpm build scripts
+        working-directory: Sub-Store/backend
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const file = 'pnpm-workspace.yaml';
+          const approved = ['core-js', 'esbuild', 'nodemon'];
+          let text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+          text = text.replace(/^onlyBuiltDependencies:\n(?:[ \t].*(?:\n|$))*/m, '');
+          if (!/^packages:/m.test(text)) {
+            text = `packages:\n  - .\n${text.trim() ? `\n${text.trimStart()}` : ''}`;
+          }
+          if (!/^allowBuilds:/m.test(text)) {
+            text = `${text.replace(/\s*$/, '')}\nallowBuilds:\n`;
+          }
+          for (const name of approved) {
+            const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const pattern = new RegExp(`^(\\s*${escaped}\\s*:\\s*).*$`, 'm');
+            if (pattern.test(text)) text = text.replace(pattern, '$1true');
+            else text = text.replace(/^allowBuilds:\n/m, `allowBuilds:\n  ${name}: true\n`);
+          }
+          fs.writeFileSync(file, text);
+          NODE
+
+      - name: Install Sub-Store dependencies
+        working-directory: Sub-Store/backend
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Install Workers adapter dependencies
+        working-directory: sub-store-workers
+        run: npm ci
+
+      - name: Build Worker
+        working-directory: sub-store-workers
+        run: npm run build
+
+      - name: Create or reuse KV Namespace
+        id: kv
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/storage/kv/namespaces"
+          headers=(-H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" -H "Content-Type: application/json")
+          response=$(curl --fail-with-body --silent --show-error "${headers[@]}" "$api")
+          namespace_id=$(printf '%s' "$response" | jq -r --arg title "$KV_NAMESPACE_TITLE" '.result[] | select(.title == $title) | .id' | head -n 1)
+          if [ -z "$namespace_id" ]; then
+            response=$(curl --fail-with-body --silent --show-error "${headers[@]}" -X POST --data "{\"title\":\"${KV_NAMESPACE_TITLE}\"}" "$api")
+            namespace_id=$(printf '%s' "$response" | jq -r '.result.id')
+          fi
+          test -n "$namespace_id" && test "$namespace_id" != "null"
+          echo "id=$namespace_id" >> "$GITHUB_OUTPUT"
+          echo "Using KV namespace ${KV_NAMESPACE_TITLE} (${namespace_id})"
+
+      - name: Generate wrangler.toml
+        working-directory: sub-store-workers
+        env:
+          KV_NAMESPACE_ID: ${{ steps.kv.outputs.id }}
+        run: |
+          cat > wrangler.toml <<TOML
+          name = "${WORKER_NAME}"
+          main = "dist/worker.js"
+          compatibility_date = "2024-09-23"
+          compatibility_flags = ["nodejs_compat"]
+          workers_dev = true
+
+          [[kv_namespaces]]
+          binding = "SUB_STORE_DATA"
+          id = "${KV_NAMESPACE_ID}"
+
+          [vars]
+          SCRIPT_ENGINE = "quickjs"
+          SUB_STORE_FRONTEND_BACKEND_PATH = "/"
+          SUB_STORE_BACKEND_CUSTOM_NAME = "Sub-Store API"
+          SUB_STORE_BACKEND_CUSTOM_ICON = "https://cdn.jsdelivr.net/gh/Yu9191/sub-store-workers@main/png/cloudflare.png"
+          TOML
+
+      - name: Deploy Worker API
+        working-directory: sub-store-workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy
+
+      - name: Verify Worker API
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          api="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${WORKER_NAME}"
+          curl --fail-with-body --silent --show-error -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" "$api" -o /dev/null
+          echo "Cloudflare Worker ${WORKER_NAME} is deployed and readable."
